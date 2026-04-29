@@ -1,0 +1,35 @@
+appId: com.alfredkensington.gemini
+productName: Gemini
+copyright: >-
+  MIT. This app is a wrapper around Google's Gemini web app.
+  While this app is licensed under MIT, Google reserves all rights
+  to their Gemini software.
+
+directories:
+  output: dist
+  buildResources: resources
+
+files:
+  - out/**/*
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  icon: resources/icon.icns
+  minimumSystemVersion: "13.0.0"
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSCameraUsageDescription: "Gemini may use your camera for video features."
+    NSMicrophoneUsageDescription: "Gemini may use your microphone for voice input."
+    NSDownloadsFolderUsageDescription: "Gemini saves downloaded files to your Downloads folder."
+
+dmg:
+  title: Gemini
+  sign: false
+  writeUpdateInfo: false
