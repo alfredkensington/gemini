@@ -1,10 +1,10 @@
 import {
   app,
   BrowserWindow,
+  WebContentsView,
   session,
   shell,
   Menu,
-  ipcMain,
   nativeImage,
   type MenuItemConstructorOptions
 } from 'electron'
@@ -13,38 +13,32 @@ import { homedir } from 'os'
 import { is } from '@electron-toolkit/utils'
 
 const ICON_PATH = join(__dirname, '../../resources/icon.icns')
-
-// Must be called before app.whenReady()
-// Prevents Chromium from advertising automation mode, which Google uses to block sign-in
-app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
-
+const GEMINI_URL = 'https://gemini.google.com/app'
 const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+// Prevent Chromium from advertising automation mode — Google sign-in checks for this flag
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
 
 function setupGeminiSession(): void {
   const geminiSession = session.fromPartition('persist:gemini')
 
-  // Override UA at the session level so HTTP request headers also carry the spoofed UA
+  // Set UA at session level so HTTP request headers carry the spoofed UA, not just navigator.userAgent
   geminiSession.setUserAgent(CHROME_UA)
 
-  // Inject the webdriver-hiding preload into every page loaded in this session.
-  // This must use setPreloads (not executeJavaScript) so it runs before any page script.
-  const webviewPreloadPath = app.isPackaged
+  // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows)
+  const preloadPath = app.isPackaged
     ? join(process.resourcesPath, 'webview-preload.js')
     : join(__dirname, '../../resources/webview-preload.js')
-  geminiSession.setPreloads([webviewPreloadPath])
+  geminiSession.setPreloads([preloadPath])
 
-  // Allow all permissions: clipboard, camera, microphone, notifications, etc.
-  geminiSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+  geminiSession.setPermissionRequestHandler((_wc, _permission, callback) => {
     callback(true)
   })
-
   geminiSession.setPermissionCheckHandler(() => true)
 
-  // Auto-save downloads to ~/Downloads/
   geminiSession.on('will-download', (_event, item) => {
-    const savePath = join(homedir(), 'Downloads', item.getFilename())
-    item.setSavePath(savePath)
+    item.setSavePath(join(homedir(), 'Downloads', item.getFilename()))
   })
 }
 
@@ -103,9 +97,10 @@ function createAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-function createWindow(): BrowserWindow {
+function createWindow(): void {
   const icon = nativeImage.createFromPath(ICON_PATH)
 
+  // Shell window — renders only the React loading screen
   const win = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -117,85 +112,116 @@ function createWindow(): BrowserWindow {
     show: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      webviewTag: true,
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
+      // No webviewTag — Gemini runs in a WebContentsView instead
     }
   })
 
+  // Show shell window as soon as the React loading screen is painted
   win.once('ready-to-show', () => win.show())
 
-  // Handle new-window requests from the BrowserWindow itself
+  // External links from the shell window open in the system browser
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
   })
 
-  // Configure webview after it attaches: allow Google OAuth popups,
-  // handle external links, and wire up per-webview download handling.
-  win.webContents.on('did-attach-webview', (_event, wc) => {
-    wc.setWindowOpenHandler(({ url }) => {
-      if (
-        url.startsWith('https://accounts.google.com') ||
-        url.startsWith('https://gemini.google.com')
-      ) {
-        return { action: 'allow' }
-      }
-      shell.openExternal(url)
-      return { action: 'deny' }
-    })
-
-    // Fallback: also catch downloads initiated from inside the webview
-    wc.session.on('will-download', (_event2, item) => {
-      const savePath = join(homedir(), 'Downloads', item.getFilename())
-      if (!item.getSavePath()) {
-        item.setSavePath(savePath)
-      }
-    })
+  // ── Gemini content view ───────────────────────────────────────────────────
+  // WebContentsView is a first-class Chromium renderer — NOT a guest WebView.
+  // Google's sign-in blocks embedded WebViews (<webview> tag) but allows this.
+  const geminiView = new WebContentsView({
+    webPreferences: {
+      partition: 'persist:gemini',
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
   })
+  win.contentView.addChildView(geminiView)
+
+  let geminiReady = false
+
+  const contentSize = (): { width: number; height: number } => {
+    const [width, height] = win.getContentSize()
+    return { width, height }
+  }
+
+  const showGemini = (): void => {
+    const { width, height } = contentSize()
+    geminiView.setBounds({ x: 0, y: 0, width, height })
+  }
+
+  const hideGemini = (): void => {
+    geminiView.setBounds({ x: 0, y: 0, width: 0, height: 0 })
+  }
+
+  // Keep geminiView filling the client area on every window resize
+  const onResize = (): void => {
+    if (geminiReady) showGemini()
+  }
+  win.on('resize', onResize)
+  win.on('enter-full-screen', onResize)
+  win.on('leave-full-screen', onResize)
+
+  // Navigation started — hide Gemini, reveal loading screen
+  geminiView.webContents.on('did-start-loading', () => {
+    geminiReady = false
+    hideGemini()
+    win.webContents.send('loading-changed', true)
+  })
+
+  // Navigation finished — expand Gemini over the loading screen
+  geminiView.webContents.on('did-stop-loading', () => {
+    geminiReady = true
+    showGemini()
+    win.webContents.send('loading-changed', false)
+  })
+
+  // Context menu — handled directly; no IPC round-trip required
+  geminiView.webContents.on('context-menu', (_event, params) => {
+    const { selectionText, isEditable } = params
+    const items: MenuItemConstructorOptions[] = []
+
+    if (selectionText?.length > 0 || !isEditable) {
+      items.push({ label: 'Copy', click: () => geminiView.webContents.copy() })
+    }
+    if (isEditable) {
+      if (items.length > 0) items.push({ type: 'separator' })
+      items.push({ label: 'Paste', click: () => geminiView.webContents.paste() })
+    }
+    if (items.length === 0) {
+      items.push(
+        { label: 'Copy', click: () => geminiView.webContents.copy() },
+        { type: 'separator' },
+        { label: 'Paste', click: () => geminiView.webContents.paste() }
+      )
+    }
+
+    Menu.buildFromTemplate(items).popup({ window: win })
+  })
+
+  // New-window handler for Gemini: allow Google OAuth popups, open others externally
+  geminiView.webContents.setWindowOpenHandler(({ url }) => {
+    if (
+      url.startsWith('https://accounts.google.com') ||
+      url.startsWith('https://gemini.google.com')
+    ) {
+      return { action: 'allow' }
+    }
+    shell.openExternal(url)
+    return { action: 'deny' }
+  })
+
+  geminiView.webContents.loadURL(GEMINI_URL)
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
-
-  return win
 }
-
-// IPC: show native Copy/Paste context menu and relay action back to renderer
-ipcMain.on('show-context-menu', (event, params: { selectionText: string; isEditable: boolean }) => {
-  const { selectionText, isEditable } = params
-  const items: MenuItemConstructorOptions[] = []
-
-  if (selectionText?.length > 0 || !isEditable) {
-    items.push({
-      label: 'Copy',
-      click: () => event.sender.send('context-menu-action', 'copy')
-    })
-  }
-
-  if (isEditable) {
-    if (items.length > 0) items.push({ type: 'separator' })
-    items.push({
-      label: 'Paste',
-      click: () => event.sender.send('context-menu-action', 'paste')
-    })
-  }
-
-  if (items.length === 0) {
-    items.push(
-      { label: 'Copy', click: () => event.sender.send('context-menu-action', 'copy') },
-      { type: 'separator' },
-      { label: 'Paste', click: () => event.sender.send('context-menu-action', 'paste') }
-    )
-  }
-
-  const menu = Menu.buildFromTemplate(items)
-  const win = BrowserWindow.fromWebContents(event.sender)
-  if (win) menu.popup({ window: win })
-})
 
 app.whenReady().then(() => {
   setupGeminiSession()

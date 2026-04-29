@@ -23,32 +23,10 @@ body,
   background: #ffffff;
 }
 
-/* ── Webview fills the entire window ── */
-webview {
-  display: flex;
-  width: 100%;
-  height: 100%;
-  border: none;
-  position: absolute;
-  inset: 0;
-  transition: opacity 0.28s ease;
-}
-
-.webview--visible {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.webview--hidden {
-  opacity: 0;
-  pointer-events: none;
-}
-
 /* ── Loading overlay ── */
 .loader {
   position: absolute;
   inset: 0;
-  z-index: 100;
   display: flex;
   align-items: center;
   justify-content: center;
