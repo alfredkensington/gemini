@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import iconPng from './icon.png'
 
 // macOS Chrome UA so Gemini serves its full desktop experience
+// Keep in sync with CHROME_UA in src/main/index.ts
 const USER_AGENT =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 const GEMINI_URL = 'https://gemini.google.com/app'
 

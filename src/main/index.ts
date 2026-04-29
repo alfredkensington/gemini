@@ -14,8 +14,25 @@ import { is } from '@electron-toolkit/utils'
 
 const ICON_PATH = join(__dirname, '../../resources/icon.icns')
 
+// Must be called before app.whenReady()
+// Prevents Chromium from advertising automation mode, which Google uses to block sign-in
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
+
+const CHROME_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
 function setupGeminiSession(): void {
   const geminiSession = session.fromPartition('persist:gemini')
+
+  // Override UA at the session level so HTTP request headers also carry the spoofed UA
+  geminiSession.setUserAgent(CHROME_UA)
+
+  // Inject the webdriver-hiding preload into every page loaded in this session.
+  // This must use setPreloads (not executeJavaScript) so it runs before any page script.
+  const webviewPreloadPath = app.isPackaged
+    ? join(process.resourcesPath, 'webview-preload.js')
+    : join(__dirname, '../../resources/webview-preload.js')
+  geminiSession.setPreloads([webviewPreloadPath])
 
   // Allow all permissions: clipboard, camera, microphone, notifications, etc.
   geminiSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
