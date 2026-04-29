@@ -25,10 +25,35 @@ const SEC_CH_UA_FULL =
 
 // Injected into every page's main world (via executeJavaScript) to patch the JS fingerprint.
 // Runs on dom-ready for the main view and all OAuth child windows.
+// Must run in main world (world 0) — preloads with contextIsolation:true run in isolated world 999
+// and cannot affect what the page's own scripts see.
+//
 // navigator.vendor: Electron returns "" — real Chrome returns "Google Inc."
+// navigator.userAgentData: Electron omits "Google Chrome" brand from .brands[] — must match sec-ch-ua
+// navigator.plugins: Electron returns empty list — Chrome always has the PDF viewer
 // window.chrome: Electron omits loadTimes/csi — Google's sign-in page checks for them.
 const BROWSER_PATCH_SCRIPT = `(function () {
   try { Object.defineProperty(navigator, 'vendor', { get: function () { return 'Google Inc.' } }) } catch (_) {}
+  try {
+    Object.defineProperty(navigator, 'userAgentData', {
+      get: function () {
+        return {
+          brands: [
+            { brand: 'Google Chrome', version: '131' },
+            { brand: 'Chromium', version: '131' },
+            { brand: 'Not_A Brand', version: '24' }
+          ],
+          mobile: false,
+          platform: 'macOS'
+        }
+      }
+    })
+  } catch (_) {}
+  try {
+    if (navigator.plugins.length === 0) {
+      Object.defineProperty(navigator, 'plugins', { get: function () { return [1, 2, 3, 4, 5] } })
+    }
+  } catch (_) {}
   const c = window.chrome
   if (c && c.runtime && typeof c.loadTimes === 'function') return
   const noop = function () {}
@@ -267,13 +292,26 @@ function createWindow(): void {
     Menu.buildFromTemplate(items).popup({ window: win })
   })
 
-  // New-window handler for Gemini: allow Google OAuth popups, open others externally
+  // New-window handler for Gemini: allow Google OAuth popups, open others externally.
+  // IMPORTANT: `partition` is NOT in Electron's inherited webPreferences list, so without
+  // overrideBrowserWindowOptions the OAuth popup would use session.defaultSession — bypassing
+  // the sec-ch-ua header rewrite and the navigator.webdriver preload entirely.
   geminiView.webContents.setWindowOpenHandler(({ url }) => {
     if (
       url.startsWith('https://accounts.google.com') ||
       url.startsWith('https://gemini.google.com')
     ) {
-      return { action: 'allow' }
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          webPreferences: {
+            partition: 'persist:gemini',
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: false
+          }
+        }
+      }
     }
     shell.openExternal(url)
     return { action: 'deny' }
