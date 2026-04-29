@@ -95,8 +95,6 @@ function createWindow(): BrowserWindow {
     minWidth: 800,
     minHeight: 600,
     title: 'Gemini',
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 16, y: 16 },
     icon,
     backgroundColor: '#ffffff',
     show: false,
