@@ -21,7 +21,9 @@ mac:
   icon: resources/icon.icns
   minimumSystemVersion: "13.0.0"
   category: public.app-category.productivity
-  hardenedRuntime: true
+  # Disable code signing — no Developer ID certificate required
+  identity: null
+  hardenedRuntime: false
   entitlements: build/entitlements.mac.plist
   entitlementsInherit: build/entitlements.mac.plist
   extendInfo:

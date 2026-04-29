@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "dist:mac:x64": "electron-vite build && electron-builder --mac --x64",
-    "dist:mac:arm64": "electron-vite build && electron-builder --mac --arm64",
-    "dist:mac:universal": "electron-vite build && electron-builder --mac --universal"
+    "dist:mac:x64": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --x64",
+    "dist:mac:arm64": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64",
+    "dist:mac:universal": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-vite build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --universal"
   },
   "author": "Alfred Kensington",
   "license": "MIT",
