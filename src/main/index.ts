@@ -6,7 +6,8 @@ import {
   shell,
   Menu,
   nativeImage,
-  type MenuItemConstructorOptions
+  type MenuItemConstructorOptions,
+  type WebContents
 } from 'electron'
 import { join } from 'path'
 import { homedir } from 'os'
@@ -64,6 +65,21 @@ const BROWSER_PATCH_SCRIPT = `(function () {
     runtime: Object.assign((c && c.runtime) || {}, { id: undefined })
   })
 })()`
+
+// Attaches Chrome DevTools Protocol and schedules BROWSER_PATCH_SCRIPT to run at
+// document-creation time — BEFORE any <head> or inline scripts execute.
+// executeJavaScript (dom-ready) is too late: Google's detection runs in <head> scripts.
+// Page.addScriptToEvaluateOnNewDocument persists across navigations; one call per webContents.
+function attachEarlyPatch(wc: WebContents): void {
+  try {
+    wc.debugger.attach('1.3')
+  } catch (_) {
+    // Already attached; sendCommand still works
+  }
+  wc.debugger
+    .sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: BROWSER_PATCH_SCRIPT })
+    .catch(() => {})
+}
 
 // Prevent Chromium from advertising automation mode — Google sign-in checks for this flag
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
@@ -237,19 +253,21 @@ function createWindow(): void {
   win.on('enter-full-screen', onResize)
   win.on('leave-full-screen', onResize)
 
-  // Patch window.chrome and navigator.vendor in the page's MAIN world on every dom-ready.
-  // contextIsolation: true means the session preload runs in an isolated world,
-  // so it cannot touch the main-world window object. executeJavaScript() targets
-  // the main world directly — same world the page's own scripts run in.
+  // Primary injection: CDP schedules BROWSER_PATCH_SCRIPT to run before any page scripts
+  // on every navigation in this webContents. Must be attached before the first loadURL.
+  attachEarlyPatch(geminiView.webContents)
+
+  // Fallback: executeJavaScript at dom-ready catches any edge case where CDP fires late
+  // (e.g. cold renderer startup) or the patch script threw and needs a second chance.
   geminiView.webContents.on('dom-ready', () => {
     geminiView.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
   })
 
-  // Google OAuth opens accounts.google.com in a child window. That window is a separate
-  // BrowserWindow with its own webContents — it does NOT inherit dom-ready listeners.
-  // We must re-apply the browser fingerprint patch there too, otherwise Google detects
-  // the inconsistency (vendor="", missing window.chrome) and blocks sign-in.
+  // For OAuth child windows: attach both CDP and dom-ready to the new webContents.
+  // The popup uses persist:gemini (via overrideBrowserWindowOptions) so session-level
+  // headers and preloads apply, but the webContents-level CDP must be wired separately.
   geminiView.webContents.on('did-create-window', (childWindow) => {
+    attachEarlyPatch(childWindow.webContents)
     childWindow.webContents.on('dom-ready', () => {
       childWindow.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
     })
