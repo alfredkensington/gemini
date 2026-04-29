@@ -10,6 +10,7 @@
     "dist:mac:arm64": "electron-vite build && electron-builder --mac --arm64",
     "dist:mac:universal": "electron-vite build && electron-builder --mac --universal"
   },
+  "author": "Alfred Kensington",
   "license": "MIT",
   "devDependencies": {
     "@electron-toolkit/tsconfig": "^1.0.1",
