@@ -16,6 +16,9 @@ const ICON_PATH = join(__dirname, '../../resources/icon.icns')
 const GEMINI_URL = 'https://gemini.google.com/app'
 const CHROME_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+// Low-entropy Client Hints sent automatically by real Chrome with every HTTPS request.
+// Electron's Chromium omits the "Google Chrome" brand — Google sign-in checks for it.
+const SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
 
 // Prevent Chromium from advertising automation mode — Google sign-in checks for this flag
 app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled')
@@ -25,6 +28,23 @@ function setupGeminiSession(): void {
 
   // Set UA at session level so HTTP request headers carry the spoofed UA, not just navigator.userAgent
   geminiSession.setUserAgent(CHROME_UA)
+
+  // Rewrite outgoing request headers to match real Chrome 131 on macOS.
+  // session.setUserAgent() patches User-Agent but leaves Sec-CH-UA untouched.
+  // Electron's Chromium sends only "Chromium";v="X" — missing "Google Chrome" brand,
+  // which is the signal accounts.google.com uses to block sign-in.
+  geminiSession.webRequest.onBeforeSendHeaders((details, callback) => {
+    const headers: Record<string, string> = {}
+    const toReplace = new Set(['user-agent', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform'])
+    for (const [k, v] of Object.entries(details.requestHeaders)) {
+      if (!toReplace.has(k.toLowerCase())) headers[k] = v
+    }
+    headers['User-Agent'] = CHROME_UA
+    headers['sec-ch-ua'] = SEC_CH_UA
+    headers['sec-ch-ua-mobile'] = '?0'
+    headers['sec-ch-ua-platform'] = '"macOS"'
+    callback({ requestHeaders: headers })
+  })
 
   // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows)
   const preloadPath = app.isPackaged
@@ -164,6 +184,28 @@ function createWindow(): void {
   win.on('resize', onResize)
   win.on('enter-full-screen', onResize)
   win.on('leave-full-screen', onResize)
+
+  // Patch window.chrome in the page's MAIN world on every dom-ready.
+  // contextIsolation: true means the session preload runs in an isolated world,
+  // so it cannot touch the main-world window object. executeJavaScript() targets
+  // the main world directly — same world the page's own scripts run in.
+  geminiView.webContents.on('dom-ready', () => {
+    geminiView.webContents
+      .executeJavaScript(
+        `(function () {
+          const c = window.chrome
+          if (c && c.runtime && typeof c.loadTimes === 'function') return
+          const noop = function () {}
+          window.chrome = Object.assign(c || {}, {
+            app: { isInstalled: false, InstallState: {}, RunningState: {}, getDetails: noop, getIsInstalled: noop, runningState: noop },
+            csi: function () { return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 } },
+            loadTimes: function () { return { requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, commitLoadTime: Date.now() / 1000, finishDocumentLoadTime: 0, finishLoadTime: 0, firstPaintTime: 0, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' } },
+            runtime: Object.assign((c && c.runtime) || {}, { id: undefined })
+          })
+        })()`
+      )
+      .catch(() => {})
+  })
 
   // Navigation started — hide Gemini, reveal loading screen
   geminiView.webContents.on('did-start-loading', () => {
