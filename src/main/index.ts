@@ -15,37 +15,80 @@ import { is } from '@electron-toolkit/utils'
 
 const ICON_PATH = join(__dirname, '../../resources/icon.icns')
 const GEMINI_URL = 'https://gemini.google.com/app'
-const CHROME_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-// Low-entropy Client Hints sent automatically by real Chrome with every HTTPS request.
-// Electron's Chromium omits the "Google Chrome" brand — Google sign-in checks for it.
-const SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+// Microsoft Edge — not Chrome — is the cleanest impersonation target for an Electron wrapper.
+// Edge is itself Chromium with rebranding (just like us), so navigator/window APIs already match.
+// accounts.google.com applies stricter "is this really Chrome?" fingerprint checks to UAs that
+// claim "Google Chrome" — every wrapper that has tried to claim Chrome has eventually been blocked
+// (nativefier, gmail-desktop, google-chat-electron, ferdium, etc. all converged on Edge/Firefox).
+// Edge is a Microsoft product Google recognises as a first-party trusted browser.
+//
+// Versions are pinned to current stable Edge on macOS at the time of writing (May 2026):
+// Edge 147.0.3912.98, based on Chromium 147. UA reduction applies to the Chrome/X.Y.Z.W token,
+// so it is "Chrome/147.0.0.0", but Edge does NOT reduce its own Edg/X.Y.Z.W token.
+const EDGE_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.3912.98'
+// Low-entropy Client Hints sent automatically by real Edge with every HTTPS request.
+// Electron's Chromium ships these as "Chromium" + "Not_A Brand" with no Edge brand — Google
+// uses the absence of a recognised brand as the primary "embedded webview" tell.
+const SEC_CH_UA = '"Microsoft Edge";v="147", "Chromium";v="147", "Not_A Brand";v="24"'
 // High-entropy full-version list — accounts.google.com requests this to verify brand consistency.
 const SEC_CH_UA_FULL =
-  '"Google Chrome";v="131.0.6778.204", "Chromium";v="131.0.6778.204", "Not_A Brand";v="24.0.0.0"'
+  '"Microsoft Edge";v="147.0.3912.98", "Chromium";v="147.0.7274.95", "Not_A Brand";v="24.0.0.0"'
 
-// Injected into every page's main world (via executeJavaScript) to patch the JS fingerprint.
-// Runs on dom-ready for the main view and all OAuth child windows.
-// Must run in main world (world 0) — preloads with contextIsolation:true run in isolated world 999
-// and cannot affect what the page's own scripts see.
+// Injected into every page's main world via CDP Page.addScriptToEvaluateOnNewDocument.
+// Runs BEFORE any <head> or inline scripts — must, because Google's detection runs synchronously
+// in the first scripts on accounts.google.com.
 //
-// navigator.vendor: Electron returns "" — real Chrome returns "Google Inc."
-// navigator.userAgentData: Electron omits "Google Chrome" brand from .brands[] — must match sec-ch-ua
-// navigator.plugins: Electron returns empty list — Chrome always has the PDF viewer
-// window.chrome: Electron omits loadTimes/csi — Google's sign-in page checks for them.
+// Why main world: session preloads with contextIsolation:true execute in isolated world 999.
+// Object.defineProperty(navigator, ...) in isolated world is invisible to the page's own scripts,
+// so the same defines have to live here and run via CDP to land in world 0.
+//
+// What we patch and why:
+//   navigator.webdriver  — Electron with --disable-blink-features=AutomationControlled normally
+//                          omits this, but defining it as `false` is what real browsers expose
+//                          and is what Google's sign-in JS checks for.
+//   navigator.vendor     — Edge inherits "Google Inc." from Chromium; Electron returns "".
+//   navigator.userAgentData
+//                        — Electron's brands[] omits Edge; must match sec-ch-ua exactly or
+//                          Google's brand-consistency check rejects the request.
+//   navigator.plugins    — Real Chromium always reports the bundled PDF viewer; an empty
+//                          plugins[] is a long-standing automation/embedded-browser tell.
+//   window.chrome.csi / loadTimes
+//                        — Edge keeps these for compatibility; Electron's Chromium build does
+//                          not, and Google's sign-in page reads them as a feature-detection.
 const BROWSER_PATCH_SCRIPT = `(function () {
+  try { Object.defineProperty(navigator, 'webdriver', { get: function () { return false } }) } catch (_) {}
   try { Object.defineProperty(navigator, 'vendor', { get: function () { return 'Google Inc.' } }) } catch (_) {}
   try {
+    const brands = [
+      { brand: 'Microsoft Edge', version: '147' },
+      { brand: 'Chromium', version: '147' },
+      { brand: 'Not_A Brand', version: '24' }
+    ]
+    const fullVersionList = [
+      { brand: 'Microsoft Edge', version: '147.0.3912.98' },
+      { brand: 'Chromium', version: '147.0.7274.95' },
+      { brand: 'Not_A Brand', version: '24.0.0.0' }
+    ]
     Object.defineProperty(navigator, 'userAgentData', {
       get: function () {
         return {
-          brands: [
-            { brand: 'Google Chrome', version: '131' },
-            { brand: 'Chromium', version: '131' },
-            { brand: 'Not_A Brand', version: '24' }
-          ],
+          brands: brands,
           mobile: false,
-          platform: 'macOS'
+          platform: 'macOS',
+          getHighEntropyValues: function (hints) {
+            const result = { brands: brands, mobile: false, platform: 'macOS' }
+            if (!hints) return Promise.resolve(result)
+            if (hints.indexOf('platformVersion') !== -1) result.platformVersion = '13.6.0'
+            if (hints.indexOf('architecture') !== -1) result.architecture = 'x86'
+            if (hints.indexOf('bitness') !== -1) result.bitness = '64'
+            if (hints.indexOf('model') !== -1) result.model = ''
+            if (hints.indexOf('uaFullVersion') !== -1) result.uaFullVersion = '147.0.3912.98'
+            if (hints.indexOf('fullVersionList') !== -1) result.fullVersionList = fullVersionList
+            if (hints.indexOf('wow64') !== -1) result.wow64 = false
+            return Promise.resolve(result)
+          },
+          toJSON: function () { return { brands: brands, mobile: false, platform: 'macOS' } }
         }
       }
     })
@@ -88,12 +131,14 @@ function setupGeminiSession(): void {
   const geminiSession = session.fromPartition('persist:gemini')
 
   // Set UA at session level so HTTP request headers carry the spoofed UA, not just navigator.userAgent
-  geminiSession.setUserAgent(CHROME_UA)
+  geminiSession.setUserAgent(EDGE_UA)
 
-  // Rewrite outgoing request headers to match real Chrome 131 on macOS.
+  // Rewrite outgoing request headers to match real Microsoft Edge 147 on macOS.
   // session.setUserAgent() patches User-Agent but leaves Sec-CH-UA untouched.
-  // Electron's Chromium sends only "Chromium";v="X" — missing "Google Chrome" brand,
-  // which is the signal accounts.google.com uses to block sign-in.
+  // Electron's Chromium sends only "Chromium";v="X" — missing the "Microsoft Edge" brand,
+  // which is the signal accounts.google.com uses to flag the client as an embedded webview.
+  // sec-ch-ua-platform-version is included because accounts.google.com lists it in Accept-CH
+  // and a missing high-entropy hint after a server request for it is itself a fingerprint.
   geminiSession.webRequest.onBeforeSendHeaders((details, callback) => {
     const headers: Record<string, string> = {}
     const toReplace = new Set([
@@ -101,16 +146,28 @@ function setupGeminiSession(): void {
       'sec-ch-ua',
       'sec-ch-ua-mobile',
       'sec-ch-ua-platform',
-      'sec-ch-ua-full-version-list'
+      'sec-ch-ua-platform-version',
+      'sec-ch-ua-full-version',
+      'sec-ch-ua-full-version-list',
+      'sec-ch-ua-arch',
+      'sec-ch-ua-bitness',
+      'sec-ch-ua-model',
+      'sec-ch-ua-wow64'
     ])
     for (const [k, v] of Object.entries(details.requestHeaders)) {
       if (!toReplace.has(k.toLowerCase())) headers[k] = v
     }
-    headers['User-Agent'] = CHROME_UA
+    headers['User-Agent'] = EDGE_UA
     headers['sec-ch-ua'] = SEC_CH_UA
     headers['sec-ch-ua-mobile'] = '?0'
     headers['sec-ch-ua-platform'] = '"macOS"'
+    headers['sec-ch-ua-platform-version'] = '"13.6.0"'
+    headers['sec-ch-ua-full-version'] = '"147.0.3912.98"'
     headers['sec-ch-ua-full-version-list'] = SEC_CH_UA_FULL
+    headers['sec-ch-ua-arch'] = '"x86"'
+    headers['sec-ch-ua-bitness'] = '"64"'
+    headers['sec-ch-ua-model'] = '""'
+    headers['sec-ch-ua-wow64'] = '?0'
     callback({ requestHeaders: headers })
   })
 
@@ -313,7 +370,7 @@ function createWindow(): void {
   // New-window handler for Gemini: allow Google OAuth popups, open others externally.
   // IMPORTANT: `partition` is NOT in Electron's inherited webPreferences list, so without
   // overrideBrowserWindowOptions the OAuth popup would use session.defaultSession — bypassing
-  // the sec-ch-ua header rewrite and the navigator.webdriver preload entirely.
+  // the sec-ch-ua header rewrite and the file-input preload entirely.
   geminiView.webContents.setWindowOpenHandler(({ url }) => {
     if (
       url.startsWith('https://accounts.google.com') ||

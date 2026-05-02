@@ -1,22 +1,13 @@
 // Runs before any page script in every page loaded by the persist:gemini session,
 // including Google OAuth popup windows.
+//
+// NOTE: this preload runs in an ISOLATED world (contextIsolation: true). Anything that
+// must be visible to the page's own scripts (navigator.* defines, window.chrome, etc.)
+// is injected from the main process via CDP Page.addScriptToEvaluateOnNewDocument and
+// lives in BROWSER_PATCH_SCRIPT in src/main/index.ts. Only DOM-level work belongs here.
 
-// 1. Remove automation signals that cause Google to reject sign-in
-Object.defineProperty(navigator, 'webdriver', { get: () => false })
-
-;(function () {
-  const automationKeys = Object.keys(window).filter(
-    (k) => k.startsWith('cdc_') || k.startsWith('$chrome_')
-  )
-  automationKeys.forEach((k) => {
-    try {
-      delete window[k]
-    } catch (_) {}
-  })
-})()
-
-// 2. Patch file inputs: strip accept restrictions, enable multiple selection.
-//    Runs after DOM is available so the MutationObserver can attach to document.body.
+// Patch file inputs: strip accept restrictions, enable multiple selection.
+// Runs after DOM is available so the MutationObserver can attach to document.body.
 function patchFileInputs() {
   document.querySelectorAll('input[type="file"]').forEach(function (el) {
     if (!el.hasAttribute('data-gemini-patched')) {
