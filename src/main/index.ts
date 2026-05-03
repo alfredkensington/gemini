@@ -116,26 +116,85 @@ const BROWSER_PATCH_SCRIPT = `(function () {
   })
 })()`
 
-// Attaches Chrome DevTools Protocol and schedules BROWSER_PATCH_SCRIPT to run at
-// document-creation time — BEFORE any <head> or inline scripts execute.
-// executeJavaScript (dom-ready) is too late: Google's detection runs in <head> scripts.
-// Page.addScriptToEvaluateOnNewDocument persists across navigations; one call per webContents.
+// Schedules BROWSER_PATCH_SCRIPT to run at document-creation time — BEFORE any <head>
+// or inline scripts execute. executeJavaScript (dom-ready) is too late: Google's
+// detection runs in <head> scripts. Page.addScriptToEvaluateOnNewDocument persists
+// across navigations; one call per webContents covers all future loads.
 //
-// IMPORTANT: returns a Promise. Callers MUST await before triggering the first navigation,
-// otherwise the loadURL IPC can race ahead of the script-registration IPC and the very first
-// document load executes Google's detection before our patches land.
-async function attachEarlyPatch(wc: WebContents): Promise<void> {
+// Both attach() and sendCommand() can throw SYNCHRONOUSLY in failure modes (debugger
+// already attached by something else, contents destroyed, etc.) — not just reject. A
+// bare .catch() on the promise would miss those, so the sendCommand call itself is
+// wrapped in try/catch in addition to the rejection handler.
+//
+// Two callers use this function:
+//   - The Gemini view via initGeminiView, where the about:blank pre-load guarantees
+//     a live renderer before this is invoked, so the registration completes against
+//     a real CDP session before the real navigation begins.
+//   - OAuth popups via did-create-window, where the popup is born loading its target
+//     URL and we cannot interpose. There the pre-loadURL ordering relies on Chromium
+//     queueing the addScriptToEvaluateOnNewDocument in the browser process and applying
+//     it during renderer init, before document parse — empirically reliable but not
+//     formally guaranteed; the dom-ready executeJavaScript fallback in the same handler
+//     covers the case where the queued script somehow misses the first parse.
+function attachEarlyPatch(wc: WebContents): void {
   try {
     wc.debugger.attach('1.3')
-  } catch (_) {
-    // Already attached; sendCommand still works
+  } catch (err) {
+    // Already attached, or contents destroyed. sendCommand below will surface the real
+    // failure if the debugger truly isn't usable.
+    log('main', 'debug', `CDP attach skipped: ${(err as Error).message}`)
+  }
+  try {
+    wc.debugger
+      .sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: BROWSER_PATCH_SCRIPT })
+      .then(() => log('main', 'debug', `CDP early-patch registered for wc#${wc.id}`))
+      .catch((err) =>
+        log('main', 'error', `CDP early-patch rejected: ${(err as Error).message}`)
+      )
+  } catch (err) {
+    log('main', 'error', `CDP early-patch threw synchronously: ${(err as Error).message}`)
+  }
+}
+
+// Two-step initialisation for the main Gemini view. Closes the ordering gap that
+// Copilot's review (PR #1, line 449) flagged: fire-and-forget attachEarlyPatch leaves
+// no formal guarantee that Page.addScriptToEvaluateOnNewDocument has been processed
+// before loadURL(GEMINI_URL) starts the navigation, even though Chromium's browser-
+// process queue makes this work in practice.
+//
+// Step 1: loadURL('about:blank') — spawns the renderer cheaply, no network. The
+//         awaited promise resolves only once the blank document is committed, so by
+//         the time we move on, the webContents has a live renderer that CDP can talk to.
+// Step 2: await sendCommand on Page.addScriptToEvaluateOnNewDocument. Now safe to
+//         await — the renderer exists, the CDP response will come back, no deadlock.
+// Step 3: loadURL(GEMINI_URL) starts the real navigation with the patch script
+//         registered. The first document Google's detection sees is patched.
+async function initGeminiView(view: WebContentsView): Promise<void> {
+  const wc = view.webContents
+  try {
+    await wc.loadURL('about:blank')
+  } catch (err) {
+    // about:blank should never fail, but if it does we still want the real load to fire
+    // so the user sees something (and any console-message from that load goes to the log).
+    log('main', 'error', `about:blank pre-load failed: ${(err as Error).message}`)
+  }
+  try {
+    wc.debugger.attach('1.3')
+  } catch (err) {
+    log('main', 'debug', `CDP attach skipped: ${(err as Error).message}`)
   }
   try {
     await wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
       source: BROWSER_PATCH_SCRIPT
     })
+    log('main', 'debug', `CDP early-patch registered for wc#${wc.id} (gemini view)`)
   } catch (err) {
-    log('main', 'error', `attachEarlyPatch failed: ${(err as Error).message}`)
+    log('main', 'error', `CDP early-patch failed (gemini view): ${(err as Error).message}`)
+  }
+  try {
+    await wc.loadURL(GEMINI_URL)
+  } catch (err) {
+    log('main', 'error', `Gemini load failed: ${(err as Error).message}`)
   }
 }
 
@@ -186,11 +245,16 @@ function setupGeminiSession(): void {
     callback({ requestHeaders: headers })
   })
 
-  // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows)
+  // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows).
+  // registerPreloadScript replaced setPreloads in Electron 35 — same effect, no deprecation warning.
   const preloadPath = app.isPackaged
     ? join(process.resourcesPath, 'webview-preload.js')
     : join(__dirname, '../../resources/webview-preload.js')
-  geminiSession.setPreloads([preloadPath])
+  geminiSession.registerPreloadScript({
+    type: 'frame',
+    id: 'gemini-webview-preload',
+    filePath: preloadPath
+  })
 
   geminiSession.setPermissionRequestHandler((_wc, _permission, callback) => {
     callback(true)
@@ -366,7 +430,7 @@ function createAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-async function createWindow(): Promise<void> {
+function createWindow(): void {
   const icon = nativeImage.createFromPath(ICON_PATH)
 
   // Shell window — renders only the React loading screen
@@ -438,14 +502,10 @@ async function createWindow(): Promise<void> {
   win.on('enter-full-screen', onResize)
   win.on('leave-full-screen', onResize)
 
-  // Primary injection: CDP schedules BROWSER_PATCH_SCRIPT to run before any page scripts
-  // on every navigation in this webContents. Must be attached AND the CDP send awaited
-  // before the first loadURL — otherwise the load can race the script registration and
-  // Google's <head>-time detection runs against the un-patched fingerprint.
-  await attachEarlyPatch(geminiView.webContents)
-
-  // Fallback: executeJavaScript at dom-ready catches any edge case where CDP fires late
-  // (e.g. cold renderer startup) or the patch script threw and needs a second chance.
+  // Fallback: executeJavaScript at dom-ready catches any edge case where the CDP-registered
+  // script somehow doesn't fire on a navigation — e.g. an internal subframe or a redirect
+  // chain that races script application. Doesn't help with Google's <head>-time detection
+  // (which is exactly why we use CDP for the primary injection), but defends the steady state.
   geminiView.webContents.on('dom-ready', () => {
     geminiView.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
   })
@@ -453,13 +513,9 @@ async function createWindow(): Promise<void> {
   // For OAuth child windows: attach both CDP and dom-ready to the new webContents.
   // The popup uses persist:gemini (via overrideBrowserWindowOptions) so session-level
   // headers and preloads apply, but the webContents-level CDP must be wired separately.
-  // CDP attach is awaited inside an async IIFE so the listener stays sync (Electron
-  // does not await listener return values, so any pre-load fingerprint use in the popup
-  // could still race; in practice OAuth popups load over the network and the CDP
-  // round-trip beats the network handshake).
   geminiView.webContents.on('did-create-window', (childWindow) => {
     setupConsoleLogging(childWindow.webContents, 'oauth')
-    void attachEarlyPatch(childWindow.webContents)
+    attachEarlyPatch(childWindow.webContents)
     childWindow.webContents.on('dom-ready', () => {
       childWindow.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
     })
@@ -527,13 +583,18 @@ async function createWindow(): Promise<void> {
     return { action: 'deny' }
   })
 
-  geminiView.webContents.loadURL(GEMINI_URL)
-
+  // Load the shell first so the React loading screen paints while the Gemini view
+  // is still doing its two-step CDP/about:blank/loadURL dance below.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  // Two-step nav for the Gemini view (about:blank → CDP register → real URL).
+  // Fired without await so createWindow stays sync — the function manages its own
+  // error logging via /tmp/gemini.log.
+  void initGeminiView(geminiView)
 }
 
 app.whenReady().then(async () => {
@@ -543,10 +604,11 @@ app.whenReady().then(async () => {
   // otherwise the rejection-page service worker can answer the load from cache.
   await wipeStaleSessionStateOnce()
   createAppMenu()
-  await createWindow()
+  createWindow()
+  log('main', 'info', 'window created, navigation initiated')
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) void createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
