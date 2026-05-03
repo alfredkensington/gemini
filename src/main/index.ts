@@ -121,22 +121,22 @@ const BROWSER_PATCH_SCRIPT = `(function () {
 // executeJavaScript (dom-ready) is too late: Google's detection runs in <head> scripts.
 // Page.addScriptToEvaluateOnNewDocument persists across navigations; one call per webContents.
 //
-// IMPORTANT: returns a Promise. Callers MUST await before triggering the first navigation,
-// otherwise the loadURL IPC can race ahead of the script-registration IPC and the very first
-// document load executes Google's detection before our patches land.
-async function attachEarlyPatch(wc: WebContents): Promise<void> {
+// Fire-and-forget on the sendCommand promise is INTENTIONAL: a WebContentsView that has
+// not yet been told to load anything has no renderer for CDP to talk to, so the promise
+// would not resolve until after loadURL. Awaiting it would deadlock the caller against
+// the very loadURL that is supposed to wake the renderer up. Chromium queues the script
+// registration in the browser process and applies it during renderer init, before the
+// first document parse — so the script is in place by the time Google's detection runs.
+function attachEarlyPatch(wc: WebContents): void {
   try {
     wc.debugger.attach('1.3')
   } catch (_) {
     // Already attached; sendCommand still works
   }
-  try {
-    await wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
-      source: BROWSER_PATCH_SCRIPT
-    })
-  } catch (err) {
-    log('main', 'error', `attachEarlyPatch failed: ${(err as Error).message}`)
-  }
+  wc.debugger
+    .sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: BROWSER_PATCH_SCRIPT })
+    .then(() => log('main', 'debug', `CDP early-patch registered for wc#${wc.id}`))
+    .catch((err) => log('main', 'error', `CDP early-patch failed: ${(err as Error).message}`))
 }
 
 // Prevent Chromium from advertising automation mode — Google sign-in checks for this flag
@@ -186,11 +186,16 @@ function setupGeminiSession(): void {
     callback({ requestHeaders: headers })
   })
 
-  // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows)
+  // Preload runs before any page script in ALL pages/popups using this session (including OAuth windows).
+  // registerPreloadScript replaced setPreloads in Electron 35 — same effect, no deprecation warning.
   const preloadPath = app.isPackaged
     ? join(process.resourcesPath, 'webview-preload.js')
     : join(__dirname, '../../resources/webview-preload.js')
-  geminiSession.setPreloads([preloadPath])
+  geminiSession.registerPreloadScript({
+    type: 'frame',
+    id: 'gemini-webview-preload',
+    filePath: preloadPath
+  })
 
   geminiSession.setPermissionRequestHandler((_wc, _permission, callback) => {
     callback(true)
@@ -366,7 +371,7 @@ function createAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-async function createWindow(): Promise<void> {
+function createWindow(): void {
   const icon = nativeImage.createFromPath(ICON_PATH)
 
   // Shell window — renders only the React loading screen
@@ -439,10 +444,9 @@ async function createWindow(): Promise<void> {
   win.on('leave-full-screen', onResize)
 
   // Primary injection: CDP schedules BROWSER_PATCH_SCRIPT to run before any page scripts
-  // on every navigation in this webContents. Must be attached AND the CDP send awaited
-  // before the first loadURL — otherwise the load can race the script registration and
-  // Google's <head>-time detection runs against the un-patched fingerprint.
-  await attachEarlyPatch(geminiView.webContents)
+  // on every navigation in this webContents. Fire-and-forget — see attachEarlyPatch for
+  // why awaiting it deadlocks: the renderer doesn't exist until loadURL.
+  attachEarlyPatch(geminiView.webContents)
 
   // Fallback: executeJavaScript at dom-ready catches any edge case where CDP fires late
   // (e.g. cold renderer startup) or the patch script threw and needs a second chance.
@@ -453,13 +457,9 @@ async function createWindow(): Promise<void> {
   // For OAuth child windows: attach both CDP and dom-ready to the new webContents.
   // The popup uses persist:gemini (via overrideBrowserWindowOptions) so session-level
   // headers and preloads apply, but the webContents-level CDP must be wired separately.
-  // CDP attach is awaited inside an async IIFE so the listener stays sync (Electron
-  // does not await listener return values, so any pre-load fingerprint use in the popup
-  // could still race; in practice OAuth popups load over the network and the CDP
-  // round-trip beats the network handshake).
   geminiView.webContents.on('did-create-window', (childWindow) => {
     setupConsoleLogging(childWindow.webContents, 'oauth')
-    void attachEarlyPatch(childWindow.webContents)
+    attachEarlyPatch(childWindow.webContents)
     childWindow.webContents.on('dom-ready', () => {
       childWindow.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
     })
@@ -543,10 +543,11 @@ app.whenReady().then(async () => {
   // otherwise the rejection-page service worker can answer the load from cache.
   await wipeStaleSessionStateOnce()
   createAppMenu()
-  await createWindow()
+  createWindow()
+  log('main', 'info', 'window created, navigation initiated')
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) void createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
