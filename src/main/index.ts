@@ -11,11 +11,17 @@ import {
 } from 'electron'
 import { join } from 'path'
 import { homedir } from 'os'
-import { existsSync, writeFileSync } from 'fs'
+import { existsSync, writeFileSync, createWriteStream, type WriteStream } from 'fs'
 import { is } from '@electron-toolkit/utils'
 
 const ICON_PATH = join(__dirname, '../../resources/icon.icns')
 const GEMINI_URL = 'https://gemini.google.com/app'
+// Real macOS version of the host. Sent both as the Sec-CH-UA-Platform-Version
+// HTTP header AND as userAgentData.getHighEntropyValues({platformVersion: true}).
+// The two MUST match — Google cross-checks them and treats a discrepancy as a
+// fingerprint signal. Using the host's real version makes the pair self-consistent
+// across every machine the app ships to.
+const PLATFORM_VERSION = process.getSystemVersion()
 // Microsoft Edge — not Chrome — is the cleanest impersonation target for an Electron wrapper.
 // Edge is itself Chromium with rebranding (just like us), so navigator/window APIs already match.
 // accounts.google.com applies stricter "is this really Chrome?" fingerprint checks to UAs that
@@ -80,7 +86,7 @@ const BROWSER_PATCH_SCRIPT = `(function () {
           getHighEntropyValues: function (hints) {
             const result = { brands: brands, mobile: false, platform: 'macOS' }
             if (!hints) return Promise.resolve(result)
-            if (hints.indexOf('platformVersion') !== -1) result.platformVersion = '13.6.0'
+            if (hints.indexOf('platformVersion') !== -1) result.platformVersion = '${PLATFORM_VERSION}'
             if (hints.indexOf('architecture') !== -1) result.architecture = 'x86'
             if (hints.indexOf('bitness') !== -1) result.bitness = '64'
             if (hints.indexOf('model') !== -1) result.model = ''
@@ -114,15 +120,23 @@ const BROWSER_PATCH_SCRIPT = `(function () {
 // document-creation time — BEFORE any <head> or inline scripts execute.
 // executeJavaScript (dom-ready) is too late: Google's detection runs in <head> scripts.
 // Page.addScriptToEvaluateOnNewDocument persists across navigations; one call per webContents.
-function attachEarlyPatch(wc: WebContents): void {
+//
+// IMPORTANT: returns a Promise. Callers MUST await before triggering the first navigation,
+// otherwise the loadURL IPC can race ahead of the script-registration IPC and the very first
+// document load executes Google's detection before our patches land.
+async function attachEarlyPatch(wc: WebContents): Promise<void> {
   try {
     wc.debugger.attach('1.3')
   } catch (_) {
     // Already attached; sendCommand still works
   }
-  wc.debugger
-    .sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: BROWSER_PATCH_SCRIPT })
-    .catch(() => {})
+  try {
+    await wc.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', {
+      source: BROWSER_PATCH_SCRIPT
+    })
+  } catch (err) {
+    log('main', 'error', `attachEarlyPatch failed: ${(err as Error).message}`)
+  }
 }
 
 // Prevent Chromium from advertising automation mode — Google sign-in checks for this flag
@@ -162,7 +176,7 @@ function setupGeminiSession(): void {
     headers['sec-ch-ua'] = SEC_CH_UA
     headers['sec-ch-ua-mobile'] = '?0'
     headers['sec-ch-ua-platform'] = '"macOS"'
-    headers['sec-ch-ua-platform-version'] = '"13.6.0"'
+    headers['sec-ch-ua-platform-version'] = `"${PLATFORM_VERSION}"`
     headers['sec-ch-ua-full-version'] = '"147.0.3912.98"'
     headers['sec-ch-ua-full-version-list'] = SEC_CH_UA_FULL
     headers['sec-ch-ua-arch'] = '"x86"'
@@ -185,6 +199,85 @@ function setupGeminiSession(): void {
 
   geminiSession.on('will-download', (_event, item) => {
     item.setSavePath(join(homedir(), 'Downloads', item.getFilename()))
+  })
+}
+
+// ── /tmp/gemini.log sink ─────────────────────────────────────────────────────
+// Append-mode write stream so consecutive launches accumulate in the same file.
+// Opened lazily on first use so a missing /tmp doesn't crash the process before
+// app.whenReady. Each launch writes a session header so runs are distinguishable.
+const LOG_PATH = '/tmp/gemini.log'
+let logStream: WriteStream | null = null
+
+function log(label: string, level: string, message: string, where = ''): void {
+  if (!logStream) {
+    logStream = createWriteStream(LOG_PATH, { flags: 'a' })
+    logStream.write(
+      `\n=== Gemini session ${new Date().toISOString()} | ` +
+        `Electron ${process.versions.electron} | Chromium ${process.versions.chrome} | ` +
+        `Node ${process.versions.node} ===\n`
+    )
+  }
+  const ts = new Date().toISOString()
+  const lvl = level.toUpperCase().padEnd(5)
+  const loc = where ? ` ${where}` : ''
+  logStream.write(`[${ts}] ${lvl} [${label}]${loc}  ${message}\n`)
+}
+
+// Map Electron's console-message levels (string in 35+, integer in older builds)
+// to the four-letter labels DevTools shows in its console UI.
+const LEVEL_FROM_INT: Record<number, string> = { 0: 'debug', 1: 'info', 2: 'warn', 3: 'error' }
+function normaliseLevel(level: unknown): string {
+  if (typeof level === 'number') return LEVEL_FROM_INT[level] ?? `lvl${level}`
+  if (typeof level === 'string') {
+    if (level === 'warning') return 'warn'
+    return level
+  }
+  return 'info'
+}
+
+// Mirror everything that would appear in DevTools Console for `wc` to /tmp/gemini.log.
+// Covers: console.{log,info,warn,error,debug}, uncaught JS exceptions (Chromium routes
+// these through console-message), CSP/security/deprecation warnings, plus three out-of-band
+// channels DevTools also surfaces: preload-script errors, renderer crashes, and load failures.
+function setupConsoleLogging(wc: WebContents, label: string): void {
+  // Electron 35+ delivers a single Event with .level/.message/.lineNumber/.sourceId/.frame.
+  // Older Electron used (event, level, message, line, sourceId). Handle both shapes so a
+  // future downgrade doesn't silently drop the log feed.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  wc.on('console-message', (...args: any[]) => {
+    let level: unknown, message = '', line = 0, sourceId = ''
+    const first = args[0]
+    if (first && typeof first === 'object' && 'level' in first && 'message' in first) {
+      level = first.level
+      message = String(first.message ?? '')
+      line = Number(first.lineNumber ?? 0)
+      sourceId = String(first.sourceId ?? '')
+    } else {
+      level = args[1]
+      message = String(args[2] ?? '')
+      line = Number(args[3] ?? 0)
+      sourceId = String(args[4] ?? '')
+    }
+    log(label, normaliseLevel(level), message, sourceId ? `${sourceId}:${line}` : '')
+  })
+
+  wc.on('preload-error', (_e, preloadPath, error) => {
+    log(label, 'error', `preload threw: ${error.message}\n${error.stack ?? ''}`, preloadPath)
+  })
+
+  wc.on('render-process-gone', (_e, details) => {
+    log(label, 'error', `renderer gone: reason=${details.reason} exitCode=${details.exitCode}`)
+  })
+
+  wc.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (errorCode === -3) return // ABORTED — fired on every user-initiated nav cancellation, noise
+    log(
+      label,
+      'error',
+      `load failed: ${errorDescription} (code ${errorCode}, mainFrame=${isMainFrame})`,
+      validatedURL
+    )
   })
 }
 
@@ -273,7 +366,7 @@ function createAppMenu(): void {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
-function createWindow(): void {
+async function createWindow(): Promise<void> {
   const icon = nativeImage.createFromPath(ICON_PATH)
 
   // Shell window — renders only the React loading screen
@@ -294,6 +387,8 @@ function createWindow(): void {
       // No webviewTag — Gemini runs in a WebContentsView instead
     }
   })
+
+  setupConsoleLogging(win.webContents, 'shell')
 
   // Show shell window as soon as the React loading screen is painted
   win.once('ready-to-show', () => win.show())
@@ -316,6 +411,8 @@ function createWindow(): void {
     }
   })
   win.contentView.addChildView(geminiView)
+
+  setupConsoleLogging(geminiView.webContents, 'gemini')
 
   let geminiReady = false
 
@@ -342,8 +439,10 @@ function createWindow(): void {
   win.on('leave-full-screen', onResize)
 
   // Primary injection: CDP schedules BROWSER_PATCH_SCRIPT to run before any page scripts
-  // on every navigation in this webContents. Must be attached before the first loadURL.
-  attachEarlyPatch(geminiView.webContents)
+  // on every navigation in this webContents. Must be attached AND the CDP send awaited
+  // before the first loadURL — otherwise the load can race the script registration and
+  // Google's <head>-time detection runs against the un-patched fingerprint.
+  await attachEarlyPatch(geminiView.webContents)
 
   // Fallback: executeJavaScript at dom-ready catches any edge case where CDP fires late
   // (e.g. cold renderer startup) or the patch script threw and needs a second chance.
@@ -354,8 +453,13 @@ function createWindow(): void {
   // For OAuth child windows: attach both CDP and dom-ready to the new webContents.
   // The popup uses persist:gemini (via overrideBrowserWindowOptions) so session-level
   // headers and preloads apply, but the webContents-level CDP must be wired separately.
+  // CDP attach is awaited inside an async IIFE so the listener stays sync (Electron
+  // does not await listener return values, so any pre-load fingerprint use in the popup
+  // could still race; in practice OAuth popups load over the network and the CDP
+  // round-trip beats the network handshake).
   geminiView.webContents.on('did-create-window', (childWindow) => {
-    attachEarlyPatch(childWindow.webContents)
+    setupConsoleLogging(childWindow.webContents, 'oauth')
+    void attachEarlyPatch(childWindow.webContents)
     childWindow.webContents.on('dom-ready', () => {
       childWindow.webContents.executeJavaScript(BROWSER_PATCH_SCRIPT).catch(() => {})
     })
@@ -433,16 +537,21 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  log('main', 'info', `app ready, loading ${GEMINI_URL}`)
   setupGeminiSession()
   // Wipe any stale Chrome-impersonation cookies/cache BEFORE the first navigation,
   // otherwise the rejection-page service worker can answer the load from cache.
   await wipeStaleSessionStateOnce()
   createAppMenu()
-  createWindow()
+  await createWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) void createWindow()
   })
+})
+
+app.on('quit', () => {
+  if (logStream) logStream.end()
 })
 
 app.on('window-all-closed', () => {
