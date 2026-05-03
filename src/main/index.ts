@@ -11,6 +11,7 @@ import {
 } from 'electron'
 import { join } from 'path'
 import { homedir } from 'os'
+import { existsSync, writeFileSync } from 'fs'
 import { is } from '@electron-toolkit/utils'
 
 const ICON_PATH = join(__dirname, '../../resources/icon.icns')
@@ -185,6 +186,36 @@ function setupGeminiSession(): void {
   geminiSession.on('will-download', (_event, item) => {
     item.setSavePath(join(homedir(), 'Downloads', item.getFilename()))
   })
+}
+
+// One-time wipe of the persist:gemini partition.
+// Earlier app versions claimed to be Google Chrome, failed accounts.google.com's
+// browser check, and in the process collected cookies (NID, GAPS, …), localStorage,
+// IndexedDB, and possibly a service worker that cached the "browser may not be secure"
+// page. All of that survives an app upgrade and re-poisons the new build before the
+// Edge spoof has a chance to take effect — accounts.google.com sees the bad cookies
+// and short-circuits straight back to the rejection page.
+//
+// Run once per install, gated by a marker file under userData. The marker name carries
+// a version so we can re-trigger the wipe in a future fix without touching old marker
+// files. The marker is created only after the wipe resolves; a crash mid-wipe re-runs
+// it on next launch, which is the safe direction.
+const WIPE_MARKER = '.session-wipe-edge-ua-v1'
+
+async function wipeStaleSessionStateOnce(): Promise<void> {
+  const markerPath = join(app.getPath('userData'), WIPE_MARKER)
+  if (existsSync(markerPath)) return
+
+  const geminiSession = session.fromPartition('persist:gemini')
+  await Promise.all([
+    geminiSession.clearStorageData(),
+    geminiSession.clearCache(),
+    geminiSession.clearAuthCache(),
+    geminiSession.clearHostResolverCache(),
+    geminiSession.clearCodeCaches({ urls: [] })
+  ])
+
+  writeFileSync(markerPath, new Date().toISOString())
 }
 
 function createAppMenu(): void {
@@ -401,8 +432,11 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   setupGeminiSession()
+  // Wipe any stale Chrome-impersonation cookies/cache BEFORE the first navigation,
+  // otherwise the rejection-page service worker can answer the load from cache.
+  await wipeStaleSessionStateOnce()
   createAppMenu()
   createWindow()
 
