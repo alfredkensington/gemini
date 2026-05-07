@@ -12,6 +12,10 @@ directories:
 files:
   - out/**/*
 
+extraResources:
+  - from: resources/webview-preload.js
+    to: webview-preload.js
+
 mac:
   target:
     - target: dmg

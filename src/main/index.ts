@@ -22,6 +22,9 @@ const GEMINI_URL = 'https://gemini.google.com/app'
 // fingerprint signal. Using the host's real version makes the pair self-consistent
 // across every machine the app ships to.
 const PLATFORM_VERSION = process.getSystemVersion()
+// Matches what real Edge reports via Sec-CH-UA-Arch and navigator.userAgentData.architecture.
+// arm64 native → 'arm'; anything else (x64, ia32, Rosetta) → 'x86'.
+const ARCH = process.arch === 'arm64' ? 'arm' : 'x86'
 // Microsoft Edge — not Chrome — is the cleanest impersonation target for an Electron wrapper.
 // Edge is itself Chromium with rebranding (just like us), so navigator/window APIs already match.
 // accounts.google.com applies stricter "is this really Chrome?" fingerprint checks to UAs that
@@ -87,7 +90,7 @@ const BROWSER_PATCH_SCRIPT = `(function () {
             const result = { brands: brands, mobile: false, platform: 'macOS' }
             if (!hints) return Promise.resolve(result)
             if (hints.indexOf('platformVersion') !== -1) result.platformVersion = '${PLATFORM_VERSION}'
-            if (hints.indexOf('architecture') !== -1) result.architecture = 'x86'
+            if (hints.indexOf('architecture') !== -1) result.architecture = '${ARCH}'
             if (hints.indexOf('bitness') !== -1) result.bitness = '64'
             if (hints.indexOf('model') !== -1) result.model = ''
             if (hints.indexOf('uaFullVersion') !== -1) result.uaFullVersion = '147.0.3912.98'
@@ -238,7 +241,7 @@ function setupGeminiSession(): void {
     headers['sec-ch-ua-platform-version'] = `"${PLATFORM_VERSION}"`
     headers['sec-ch-ua-full-version'] = '"147.0.3912.98"'
     headers['sec-ch-ua-full-version-list'] = SEC_CH_UA_FULL
-    headers['sec-ch-ua-arch'] = '"x86"'
+    headers['sec-ch-ua-arch'] = `"${ARCH}"`
     headers['sec-ch-ua-bitness'] = '"64"'
     headers['sec-ch-ua-model'] = '""'
     headers['sec-ch-ua-wow64'] = '?0'
@@ -357,7 +360,7 @@ function setupConsoleLogging(wc: WebContents, label: string): void {
 // a version so we can re-trigger the wipe in a future fix without touching old marker
 // files. The marker is created only after the wipe resolves; a crash mid-wipe re-runs
 // it on next launch, which is the safe direction.
-const WIPE_MARKER = '.session-wipe-edge-ua-v1'
+const WIPE_MARKER = '.session-wipe-edge-ua-v2'
 
 async function wipeStaleSessionStateOnce(): Promise<void> {
   const markerPath = join(app.getPath('userData'), WIPE_MARKER)
